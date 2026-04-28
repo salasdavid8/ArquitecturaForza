@@ -223,5 +223,16 @@ Deploy a producción
 
 ---
 
+## Servicios y Dominios Documentados
+
+| Servicio | Dominio | Documento |
+|---|---|---|
+| `forza-facturacion` | Finanzas / Facturación FEL | [docs/facturacion-fel/ARCHITECTURE.md](docs/facturacion-fel/ARCHITECTURE.md) |
+| `forza-firma-electronica` | Seguridad / Firma Digital | [docs/firma-electronica/ARCHITECTURE.md](docs/firma-electronica/ARCHITECTURE.md) |
+| `forza-vacaciones` | RRHH / Gestión de Vacaciones | [docs/vacaciones/ARCHITECTURE.md](docs/vacaciones/ARCHITECTURE.md) |
+| `forza-pay` | Finanzas / Pasarela de Pagos | [docs/pasarela-pagos/ARCHITECTURE.md](docs/pasarela-pagos/ARCHITECTURE.md) |
+
+---
+
 *Generado con GitHub Copilot usando `.github/copilot-instructions.md` del repositorio*
 *Stack: ForzaTech v3 — Referencia: Política_Forza_Tech_v3.docx*
