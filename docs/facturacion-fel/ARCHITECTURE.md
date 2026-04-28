@@ -1,4 +1,4 @@
-# ARCHITECTURE.md — Facturación Electrónica FEL (SAT Guatemala)
+# ARCHITECTURE.md — Facturación Electrónica FEL (SAT Guatemala) — INFILE
 
 > Generado con GitHub Copilot usando el stack ForzaTech v3.
 > Actualizar este archivo en cada cambio arquitectónico significativo.
@@ -10,12 +10,13 @@
 **Nombre:** `forza-facturacion`
 **Dominio:** `Finanzas / Facturación`
 **Track:** Innovación
+**Certificador Autorizado:** [INFILE S.A.](https://infile.com/guatemala) — +502 2208-2208 · sac@infile.com.gt
 **Responsable:** David Salas — Gerente de Desarrollo y Tecnología
 **Última actualización:** 2026-04-27
 
-Servicio de facturación electrónica en línea (**FEL**) que integra Forza Logistics Group con la **SAT Guatemala** a través de un **Certificador Autorizado** (CA). Genera, firma, certifica y almacena Documentos Tributarios Electrónicos (DTE) cumpliendo con el Acuerdo de Directorio SAT 22-2018 y sus reformas.
+Servicio de facturación electrónica en línea (**FEL**) que integra Forza Logistics Group con la **SAT Guatemala** usando **INFILE** como Certificador Autorizado. Genera, certifica y almacena Documentos Tributarios Electrónicos (DTE) cumpliendo con el Acuerdo de Directorio SAT 22-2018 y sus reformas.
 
-El flujo es orquestado con **Temporal.io** para garantizar que ningún paso se pierda ante fallos externos (timeout con SAT, caída del certificador, etc.). Todos los eventos de ciclo de vida del DTE se publican vía **NATS JetStream**.
+INFILE recibe el XML del DTE, lo valida contra los XSD de SAT, aplica la firma digital y lo transmite a SAT retornando el UUID de autorización. El flujo es orquestado con **Temporal.io** para garantizar que ningún paso se pierda ante fallos externos (timeout con INFILE, caída temporal del servicio, etc.). Todos los eventos de ciclo de vida del DTE se publican vía **NATS JetStream**.
 
 ---
 
@@ -30,8 +31,8 @@ flowchart LR
         Temporal["Temporal.io\nFELWorkflow"]
     end
 
-    subgraph CA ["Certificador Autorizado (ej: INFILE)"]
-        CAAPI["CA REST API\nHTTPS + mTLS"]
+    subgraph CA ["INFILE S.A. — Certificador Autorizado"]
+        CAAPI["INFILE REST API\nHTTPS + API Key"]
         CASign["Firma Digital\nXAdES-BES"]
         CASAT["Relay hacia SAT"]
     end
@@ -75,7 +76,7 @@ flowchart LR
     PG[("PostgreSQL\nforza_facturacion")]
     NATS[["NATS JetStream\nfacturacion.*"]]
     Temporal["Temporal.io"]
-    CAAPI["Certificador\nAutorizado API"]
+    CAAPI["INFILE API\nHTTPS + API Key"]
 
     APISIX -->|"JWT + roles"| KC
     APISIX --> CTRL
@@ -88,7 +89,7 @@ flowchart LR
     APP -->|"StartWorkflow"| Temporal
     Temporal --> WFLOW
     WFLOW -->|"GenerateDTEActivity"| APP
-    WFLOW -->|"CertifyDTEActivity (HTTPS mTLS)"| CAAPI
+    WFLOW -->|"CertifyDTEActivity\nPOST /dte/json/certificar"| CAAPI
     WFLOW -->|"StoreDTEActivity"| PG
     WFLOW -->|"NotifyActivity"| NATS
 ```
@@ -147,13 +148,15 @@ sequenceDiagram
     API->>T: StartWorkflow(FELWorkflow, dteId)
     T->>NATS: facturacion.dte.generado
 
-    T->>CA: POST /dte/certify (XML + credenciales mTLS)
-    CA->>CA: Valida estructura XML vs XSD SAT
+    T->>CA: POST /dte/json/certificar
+    Note over T,CA: Header: usuario=NIT_EMISOR, llave=INFILE_API_KEY
+    Note over T,CA: Body: { nit_emisor, xml_dte (base64) }
+    CA->>CA: Valida XML vs XSD SAT
     CA->>CA: Firma digital XAdES-BES
     CA->>SAT: Envía DTE firmado
     SAT->>SAT: Valida NIT emisor/receptor, series, correlativo
     SAT-->>CA: UUID de autorización + timestamp SAT
-    CA-->>T: DTE certificado + UUID
+    CA-->>T: { uuid, xml_certificado (base64), numero_autorizacion }
 
     alt Éxito
         T->>API: StoreDTEActivity (UUID, XML firmado, timestamp)
@@ -184,10 +187,12 @@ sequenceDiagram
     USR->>API: POST /dte/{uuid}/cancel (motivo)
     API->>API: Valida plazo legal de anulación\n(48h para facturas de consumidor final)
     API->>T: StartWorkflow(DTECancellationWorkflow)
-    T->>CA: POST /dte/cancel (UUID + motivo)
+    T->>CA: POST /dte/anulacion/json/certificar
+    Note over T,CA: Header: usuario=NIT_EMISOR, llave=INFILE_API_KEY
+    Note over T,CA: Body: { uuid_dte, motivo_anulacion, xml_anulacion (base64) }
     CA->>SAT: Solicitud de anulación
     SAT-->>CA: Confirmación / rechazo
-    CA-->>T: Resultado
+    CA-->>T: { resultado, descripcion }
     T->>NATS: facturacion.dte.anulado | facturacion.dte.anulacion_rechazada
     NATS-->>USR: Notificación del resultado
 ```
@@ -323,28 +328,88 @@ erDiagram
 
 ---
 
-## Seguridad en la Integración con el Certificador
+## Integración con INFILE — Detalle Técnico
+
+### Endpoints INFILE
+
+| Ambiente | URL Base |
+|----------|----------|
+| **Sandbox** | `https://certificacion.infile.com.gt/fel/` |
+| **Producción** | `https://fel.infile.com.gt/fel/` |
+
+| Operación | Método | Endpoint | Descripción |
+|-----------|--------|----------|-------------|
+| Certificar DTE | `POST` | `/dte/json/certificar` | Envía XML DTE en base64, retorna UUID SAT |
+| Anular DTE | `POST` | `/dte/anulacion/json/certificar` | Envía XML de anulación, retorna confirmación |
+| Consultar DTE | `GET` | `/dte/consulta/{uuid}` | Verifica estado de un DTE en SAT |
+
+### Autenticación INFILE (Headers HTTP)
+
+```http
+POST /dte/json/certificar HTTP/1.1
+Host: fel.infile.com.gt
+Content-Type: application/json
+usuario: {NIT_EMISOR}
+llave: {INFILE_API_KEY}
+```
+
+### Payload de Certificación
+
+```json
+{
+  "nit_emisor": "12345678",
+  "correo_copia": "facturacion@forzalatam.com",
+  "xml_dte": "PD94bWwgdmVyc2lvbj0..."
+}
+```
+
+### Respuesta exitosa de INFILE
+
+```json
+{
+  "uuid": "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE",
+  "numero_autorizacion": "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE",
+  "serie": "A",
+  "numero_dte": 12345,
+  "fecha_certificacion": "2026-04-27T10:00:00.000-06:00",
+  "xml_certificado": "PD94bWwgdmVyc2lvbj0..."
+}
+```
+
+### Respuesta de error INFILE
+
+```json
+{
+  "resultado": false,
+  "descripcion": "Error de validación: NIT receptor inválido",
+  "descripcion_errores": "[1001] El NIT del receptor no existe en el registro SAT"
+}
+```
+
+---
+
+## Seguridad en la Integración con INFILE
 
 ```mermaid
 flowchart LR
     API["forza-facturacion\n.NET Core API"]
     Vault["HashiCorp Vault\nSecrets"]
-    CA["Certificador\nAutorizado"]
+    CA["INFILE\nfhttps + API Key"]
     SAT["SAT Guatemala"]
 
-    API -->|"Lee cert. mTLS\nen runtime"| Vault
-    Vault -->|"Certificado TLS\nclient + private key"| API
-    API -->|"HTTPS + mTLS\n(certificado cliente)"| CA
+    API -->|"Lee API Key\nen runtime"| Vault
+    Vault -->|"usuario=NIT\nllave=API_KEY"| API
+    API -->|"HTTPS TLS 1.2+\nHeader: usuario + llave"| CA
     CA -->|"Canal seguro\nhacia SAT"| SAT
 ```
 
 **Consideraciones de seguridad:**
-- Credenciales del CA almacenadas en **HashiCorp Vault** — nunca en código ni variables de entorno en texto plano
-- Certificado digital del emisor (`.pfx`) en Vault — rotación anual según requisito SAT
-- mTLS en la comunicación con el CA
-- Audit log de **todas** las llamadas hacia el CA en `ca_audit_log`
+- `usuario` (NIT emisor) y `llave` (API Key de INFILE) almacenados en **HashiCorp Vault** — nunca en código
+- La `llave` de INFILE se rota coordinando con soporte INFILE (`sac@infile.com.gt`)
+- INFILE no requiere mTLS — usa autenticación por headers `usuario`/`llave`
+- Audit log de **todas** las llamadas hacia INFILE en `ca_audit_log` (request/response completo)
 - Rate limiting en APISIX para los endpoints de emisión (`/dte`)
-- Validación de NIT contra el API del CA antes de emitir
+- Validación de NIT receptor antes de llamar a INFILE (evita cargos por DTE con errores)
 - Los XML de DTE (originales y certificados) se almacenan cifrados en PostgreSQL
 
 ---
@@ -429,9 +494,10 @@ src/
 │   │   ├── Repositories/
 │   │   └── OutboxRelay/
 │   ├── Certifier/
-│   │   ├── InfileCertifierClient.cs    # Implementación para INFILE
-│   │   ├── DTEXmlGenerator.cs          # Genera XML vs XSD SAT
-│   │   └── XsdValidator.cs             # Valida XML antes de enviar
+    │   ├── InfileCertifierClient.cs    # POST /dte/json/certificar (headers: usuario + llave)
+    │   ├── InfileCancellationClient.cs # POST /dte/anulacion/json/certificar
+    │   ├── DTEXmlGenerator.cs          # Genera XML vs XSD SAT → convierte a base64
+    │   └── XsdValidator.cs             # Valida XML antes de enviar a INFILE
 │   ├── Temporal/
 │   │   ├── Workflows/
 │   │   │   ├── FELWorkflow.cs
@@ -509,15 +575,13 @@ ConnectionStrings__DefaultConnection=   # Vault: secret/facturacion/pg-connectio
 Keycloak__Authority=                    # https://keycloak.forzatech.com/realms/forza-prod
 Keycloak__Audience=                     # forza-facturacion
 
-# Certificador Autorizado (ej: INFILE)
-Certifier__ApiUrl=                      # Vault: secret/facturacion/ca-url
-Certifier__ApiKey=                      # Vault: secret/facturacion/ca-apikey
-Certifier__ClientCertPath=              # Vault: secret/facturacion/mtls-cert
-Certifier__ClientCertPassword=          # Vault: secret/facturacion/mtls-cert-pass
-
-# Certificado Digital del Emisor (firma DTE)
-Issuer__CertificatePfxPath=             # Vault: secret/facturacion/issuer-pfx
-Issuer__CertificatePassword=            # Vault: secret/facturacion/issuer-pfx-pass
+# INFILE — Certificador Autorizado
+Infile__ApiUrl=                         # Vault: secret/facturacion/infile-url
+                                        # Sandbox: https://certificacion.infile.com.gt/fel/
+                                        # Prod:    https://fel.infile.com.gt/fel/
+Infile__NitEmisor=                      # Vault: secret/facturacion/infile-nit
+Infile__ApiKey=                         # Vault: secret/facturacion/infile-apikey
+                                        # Header HTTP: llave={valor}
 
 # NATS
 Nats__Url=                              # nats://nats.forzatech.svc.cluster.local:4222
@@ -541,19 +605,20 @@ PR abierto
   └─> Build .NET
   └─> Tests unitarios (cobertura >= 80%)
       └─> Incluye validación de XML generado vs XSD oficial SAT
-  └─> Tests de integración contra sandbox del Certificador
+  └─> Tests de integración contra sandbox INFILE
+      (https://certificacion.infile.com.gt/fel/)
   └─> Trivy scan imagen Docker
 
 Merge a main
   └─> Build imagen Docker multi-stage
   └─> Push a GHCR: ghcr.io/forzatech/forza-facturacion:v{semver}-{sha}
   └─> Deploy a staging (Rancher Fleet)
-  └─> Smoke test: emitir DTE de prueba en ambiente sandbox SAT
+  └─> Smoke test: emitir FACT de prueba en sandbox INFILE → verificar UUID SAT
 
 Deploy a producción
   └─> Gate manual (GitHub Environments: producción)
   └─> Rancher Fleet sincroniza desde Git
-  └─> Smoke test con DTE real (monto Q0.01 en ambiente live)
+  └─> Smoke test: emitir FACT real (monto Q1.00) → verificar UUID en portal SAT
   └─> Notificación al equipo
 ```
 
@@ -563,7 +628,7 @@ Deploy a producción
 
 | Decisión | Fecha | Estado | Documento |
 |----------|-------|--------|-----------|
-| Usar Certificador Autorizado (CA) como intermediario vs integración directa SAT | 2026-04-27 | Aceptado | `docs/adr/001-certificador-autorizado.md` |
+| Usar INFILE como Certificador Autorizado vs Digifact / G4S | 2026-04-27 | Aceptado | `docs/adr/001-infile-como-certificador.md` |
 | Temporal.io para orquestar el flujo FEL con reintentos | 2026-04-27 | Aceptado | `docs/adr/002-temporal-fel-workflow.md` |
 | Almacenar XML certificado y original en PostgreSQL (cifrado) | 2026-04-27 | Aceptado | `docs/adr/003-storage-xml-dte.md` |
 | QuestPDF para generación de representación impresa del DTE | 2026-04-27 | Aceptado | `docs/adr/004-questpdf-dte.md` |
